@@ -1,5 +1,7 @@
 # No More Red - Starfield 1.16.244 outpost placement RE notes
 
+These notes were written by AI while creating this mod, and are kept up to date as development continues.
+
 Addresses are RVAs + 0x140000000 (Steam build 1.16.244, SteamStub-wrapped, .text not encrypted).
 
 ## Status byte
