@@ -6,8 +6,13 @@
 //   Object snapping  Hide snap points so items don't attach to other pieces (Home)
 //   Surface snapping Precise Placement ignores every surface the crosshair hits (End)
 //   Foundations      Don't build the auto-foundation pieces under structures (Delete)
-//   Hold distance    Move the held item closer / further (Page Down / Page Up)
+//   Workshop boundary Off = build and stay in build mode outside the build area (Page Up)
+//   Rotate with view The held item turns with the player, like Fallout 4 (Page Down)
+//   Fine rotate      Turn the held item by a small step (Ctrl + Left / Right arrow)
+//   Hold distance    Move the held item closer / further (Ctrl + Down / Up arrow)
+//                    While Ctrl is held in build mode those arrow keys don't reach the game's menus.
 //   HUD messages     The game's own top-left notification for every toggle
+// Hotkeys only act in build mode (the game's WorkshopMenu is open).
 //
 // How the core works: build mode keeps one WorkshopCodes byte per placement attempt
 // (RootWorkshopStruct+0x193 in 1.16.244, 2 = VALID). Anything else turns the preview red and
@@ -17,6 +22,7 @@
 // startup, so a renumbered enum or moved field is followed or detected rather than guessed.
 
 #include <windows.h>
+#include <shlobj.h>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -30,9 +36,9 @@
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
     SFSEPluginVersionData::kVersion,
-    3,
+    0x01010000,   // 1.1.0
     "No More Red",
-    "prototype",
+    "DonPetrol",
     SFSEPluginVersionData::kAddressIndependence_AddressLibraryV2,
     SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
     { MAKE_EXE_VERSION(1, 16, 244), 0 },
@@ -157,27 +163,92 @@ static bool Hookable(uint8_t* target)
     return c && c->count >= 1 && c->count <= 8 && g_stubsUsed + 16 * c->count <= 0x1000;
 }
 
-// Redirect every direct call to `target` into `wrapper`. Returns the number of call sites
-// (0 = not hooked). `expect` is only logged, for comparing against 1.16.244.
-static int HookCalls(const char* what, uint8_t* target, void* wrapper, int expect)
+// Call sites are found at plugin load (code still untouched) but only redirected once every
+// plugin has loaded (SFSE PostPostLoad). Other plugins that hook the same calls - e.g. Starfield
+// Engine Fixes, which refuses to install unless each call still points at the game function -
+// get there first, and No More Red then chains to whatever each call points at by that time.
+// Each site has its own wrapper instance (template slot N) and its own `next` pointer.
+struct PlannedSite { const char* what; uint8_t* site; uint8_t* target; uint8_t* stub; void** next; };
+static constexpr int kMaxPlanned = 32;
+static PlannedSite g_plan[kMaxPlanned];
+static int         g_planned = 0;
+
+// Plan one call site: a stub that jumps to `wrapper`; the wrapper calls *next (the original target
+// for now - ApplyCallHooks updates it if another plugin got there first).
+static void PlanSite(const char* what, uint8_t* site, void* wrapper, void** next)
 {
-    if (CallerSet* cs = Callers(target)) {
-        CallerSet& c = *cs;
-        Log("%s: %p, %d caller(s) (1.16.244 had %d)", what, target, c.count, expect);
-        if (!Hookable(target)) return 0;
-        for (int k = 0; k < c.count; ++k) {
-            uint8_t* stub = g_stubs + g_stubsUsed;
-            g_stubsUsed += 16;
-            uint8_t jmp[14] = { 0xFF, 0x25, 0, 0, 0, 0 };
-            memcpy(jmp + 6, &wrapper, 8);
-            memcpy(stub, jmp, sizeof(jmp));
-            int32_t rel = (int32_t)(stub - (c.sites[k] + 5));
-            Patch(c.sites[k] + 1, &rel, 4);
+    uint8_t* stub = g_stubs + g_stubsUsed;
+    g_stubsUsed += 16;
+    uint8_t jmp[14] = { 0xFF, 0x25, 0, 0, 0, 0 };
+    memcpy(jmp + 6, &wrapper, 8);
+    memcpy(stub, jmp, sizeof(jmp));
+    *next = site + 5 + I32(site + 1);
+    g_plan[g_planned++] = { what, site, (uint8_t*)*next, stub, next };
+}
+
+// Plan redirecting every direct call to `target` into wrappers[k], which call *next[k].
+// Returns the number of call sites (0 = not hooked). `expect` is only logged.
+static int HookCalls(const char* what, uint8_t* target, void* const* wrappers, void** next, int expect)
+{
+    CallerSet* cs = Callers(target);
+    if (!cs) { Log("%s: function not found", what); return 0; }
+    Log("%s: %p, %d caller(s) (1.16.244 had %d)", what, target, cs->count, expect);
+    if (!Hookable(target) || g_planned + cs->count > kMaxPlanned) return 0;
+    for (int k = 0; k < cs->count; ++k) PlanSite(what, cs->sites[k], wrappers[k], &next[k]);
+    return cs->count;
+}
+
+// Plan redirecting one specific call site (E8 at `site`) into `wrapper`, which calls *next.
+static bool HookOneCall(const char* what, uint8_t* site, void* wrapper, void** next)
+{
+    if (!InText(site) || site[0] != 0xE8 || g_planned >= kMaxPlanned || g_stubsUsed + 16 > 0x1000) return false;
+    PlanSite(what, site, wrapper, next);
+    return true;
+}
+
+static bool Executable(const void* p)
+{
+    MEMORY_BASIC_INFORMATION mi;
+    return p && VirtualQuery(p, &mi, sizeof(mi)) && mi.State == MEM_COMMIT &&
+           (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+
+// Name of the module behind a call target, following one `jmp [rip+x]` / `jmp rel32` stub.
+static const char* OwnerOf(uint8_t* p, char* buf, size_t n)
+{
+    if (Executable(p) && p[0] == 0xFF && p[1] == 0x25) memcpy(&p, p + 6 + I32(p + 2), 8);
+    else if (Executable(p) && p[0] == 0xE9)             p = p + 5 + I32(p + 1);
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)p, &m) || !GetModuleFileNameA(m, buf, (DWORD)n)) return "unknown";
+    const char* s = strrchr(buf, '\\');
+    return s ? s + 1 : buf;
+}
+
+static void ApplyCallHooks()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    int hooked = 0, chained = 0;
+    for (int i = 0; i < g_planned; ++i) {
+        PlannedSite& p = g_plan[i];
+        uint8_t* cur = p.site[0] == 0xE8 ? p.site + 5 + I32(p.site + 1) : nullptr;
+        if (cur != p.target) {
+            char name[MAX_PATH];
+            if (!cur || !Executable(cur)) {
+                Log("%s: call at %p was replaced by another plugin - left alone", p.what, p.site);
+                continue;
+            }
+            Log("%s: call at %p already hooked by %s - chaining to it", p.what, p.site, OwnerOf(cur, name, sizeof(name)));
+            ++chained;
         }
-        return c.count;
+        *p.next = cur;
+        int32_t rel = (int32_t)(p.stub - (p.site + 5));
+        Patch(p.site + 1, &rel, 4);
+        ++hooked;
     }
-    Log("%s: function not found", what);
-    return 0;
+    Log("call hooks applied: %d of %d site(s), %d chained to other plugins", hooked, g_planned, chained);
 }
 
 // ================================================================ address library
@@ -203,6 +274,16 @@ namespace ID {
     constexpr uint32_t FixedStringCtor        = 1186742;
     constexpr uint32_t FixedStringRelease     = 139340;
     constexpr uint32_t HUDNotifyFunctorVtbl   = 442192;
+    constexpr uint32_t UISingleton            = 937580;
+    constexpr uint32_t IsMenuOpen             = 130475;
+    constexpr uint32_t WorkshopMenuName       = 130425;
+    constexpr uint32_t PlayerSingleton        = 922868;
+    constexpr uint32_t ValidatePlacement      = 73744;
+    constexpr uint32_t IsInBuildArea          = 73891;
+    constexpr uint32_t IsPointInBuildArea     = 73890;
+    constexpr uint32_t PlaceOnSurface         = 121585;   // placement-mode cast handlers that return
+    constexpr uint32_t PlaceFollowCamera      = 121587;   // OutsideBuildArea for the crosshair point
+    constexpr uint32_t PlayerOutsideTimer     = 121563;   // exits build mode when the player leaves the area
 }
 
 static uint32_t* g_al = nullptr;
@@ -243,11 +324,13 @@ static uint8_t* IniSetting(uint32_t id, const char* name)
 struct Key { int vk; bool down; ULONGLONG since, last; };
 
 static struct {
-    volatile LONG enabled = 1, objectSnap = 1, surfaceSnap = 1, foundations = 1;
+    volatile LONG enabled = 1, objectSnap = 1, surfaceSnap = 1, foundations = 1, buildAnywhere = 0, rotateWithView = 0;
     bool     showMessages = true;
     uint32_t statusOffset = 0;            // 0 = auto-detect
     float    distStep = 0.25f, distMin = 0.5f, distMax = 50.0f;
-    Key      kEnabled{}, kObjectSnap{}, kSurfaceSnap{}, kFoundations{}, kFarther{}, kCloser{};
+    Key      kEnabled{}, kObjectSnap{}, kSurfaceSnap{}, kFoundations{}, kBuildAnywhere{}, kRotate{}, kFineLeft{}, kFineRight{}, kFarther{}, kCloser{};
+    float    fineStep = 1.0f;                // degrees per press
+    int      modifier = 0x11;                // held for the distance / fine rotate keys (0 = none)
 } cfg;
 
 // WorkshopCodes. Numbers are 1.16.244's; at startup they are re-derived from the game's
@@ -269,7 +352,7 @@ static CodeInfo kCodes[] = {
     { 18, "RadiusOverlap",         1, "sWorkshopPlacement_RADIUS_OVERLAP",              "Radius overlaps an existing object" },
     { 20, "OutsidePlayableArea",   0, "sWorkshopPlacement_OUTSIDE_PLAYABLE_AREA",       "Outside playable area (risky)" },
     { 21, "OverlapsOtherWorkshop", 0, "sWorkshopPlacement_PLACEMENT_OVERLAPS_WORKSHOP", "Overlaps an existing build area" },
-    { 22, "RestrictedArea",        0, "sWorkshopPlacement_PLACEMENT_RESTRICTED_AREA",   "Area is restricted" },
+    { 22, "RestrictedArea",        1, "sWorkshopPlacement_PLACEMENT_RESTRICTED_AREA",   "Area is restricted" },
     { 23, "NotOnResourceVein",     1, "sWorkshopPlacement_PLACEMENT_MISSING_RESOURCES", "Extractor not on a resource vein" },
     { 24, "MissingComponents",     0, "sWorkshopPlacement_PLACEMENT_MISSING_COMPONENTS","Missing components (cheat)" },
     { 25, "TooCloseToPlayer",      1, "sWorkshopPlacement_TOO_CLOSE_TO_PLAYER",         "Overlapping player" },
@@ -281,6 +364,7 @@ static CodeInfo kCodes[] = {
     { 31, "ExceededMaxCount",      0, "sWorkshop_EXCEEDED_MAX_COUNT",                   "Max amount of this item reached" },
 };
 static constexpr int kNoSnap = 10, kNoSnapFloor = 11, kFoundationTooTall = 19;   // indices into kCodes
+static constexpr int kOutsideBuildArea = 6;   // index into kCodes: driven by the WORKSHOP BOUNDARY toggle
 static uint8_t g_valid = 2;
 static bool    g_relax[256] = {};
 
@@ -298,12 +382,20 @@ static void LoadConfig()
     cfg.objectSnap   = I("Snapping", "ObjectSnapping", 1) != 0;
     cfg.surfaceSnap  = I("Snapping", "SurfaceSnapping", 1) != 0;
     cfg.foundations  = I("Foundations", "Foundations", 1) != 0;
+    cfg.buildAnywhere = I("WorkshopBoundary", "WorkshopBoundary", 0) == 0;   // boundary off = build anywhere
+    cfg.rotateWithView = I("Rotation", "RotateWithView", 0) != 0;
     cfg.kEnabled.vk     = I("General", "ToggleKey", 0x2D);              // Insert
     cfg.kObjectSnap.vk  = I("Snapping", "ObjectSnapToggleKey", 0x24);   // Home
     cfg.kSurfaceSnap.vk = I("Snapping", "SurfaceSnapToggleKey", 0x23);  // End
     cfg.kFoundations.vk = I("Foundations", "ToggleKey", 0x2E);          // Delete
-    cfg.kFarther.vk     = I("Distance", "FartherKey", 0x21);            // Page Up
-    cfg.kCloser.vk      = I("Distance", "CloserKey", 0x22);             // Page Down
+    cfg.kBuildAnywhere.vk = I("WorkshopBoundary", "ToggleKey", 0x21);   // Page Up
+    cfg.modifier        = I("General", "ModifierKey", 0x11);            // Ctrl
+    cfg.kRotate.vk      = I("Rotation", "ToggleKey", 0x22);             // Page Down
+    cfg.kFineLeft.vk    = I("Rotation", "FineRotateLeftKey", 0x25);     // Left arrow
+    cfg.kFineRight.vk   = I("Rotation", "FineRotateRightKey", 0x27);    // Right arrow
+    cfg.fineStep        = F("Rotation", "FineRotateStep", "1.0");
+    cfg.kFarther.vk     = I("Distance", "FartherKey", 0x26);            // Up arrow
+    cfg.kCloser.vk      = I("Distance", "CloserKey", 0x28);             // Down arrow
     cfg.distStep = F("Distance", "Step", "0.25");
     cfg.distMin  = F("Distance", "Min", "0.5");
     cfg.distMax  = F("Distance", "Max", "50");
@@ -341,54 +433,176 @@ static void ShowHUD(const char* text)
 }
 
 // ================================================================ No More Red
-// Call-site wrappers around EvaluatePlacement / UpdatePlacementStatus: run the original, then
-// turn relaxed codes into VALID. With object snapping off, "must be snapped" is relaxed too,
-// since there is nothing left to snap to.
-static char (*g_EvaluatePlacement)(void*, void*, void*, void*) = nullptr;
-static void (*g_UpdatePlacementStatus)(void*) = nullptr;
+// Call-site wrappers around EvaluatePlacement / UpdatePlacementStatus: run the original (or the
+// hook another plugin already put on that call), then turn relaxed codes into VALID. With object
+// snapping off, "must be snapped" is relaxed too, since there is nothing left to snap to.
+// Every wrapper is a template on its call-site slot N so each site calls its own `next`.
+#define SITE_WRAPPERS(fn) { (void*)&fn<0>, (void*)&fn<1>, (void*)&fn<2>, (void*)&fn<3>, \
+                            (void*)&fn<4>, (void*)&fn<5>, (void*)&fn<6>, (void*)&fn<7> }
+static char (*g_EvaluatePlacement[8])(void*, void*, void*, void*) = {};
+static void (*g_UpdatePlacementStatus[8])(void*) = {};
 static bool g_pollByTask = false;
 static void PollKeys();
+// The held item: UpdatePlacementStatus runs for it every frame (distance / fine rotate use this).
+static void*     g_heldRoot = nullptr;
+static ULONGLONG g_heldTick = 0;
+
+static bool WouldRelax(uint8_t code)
+{
+    if (!cfg.enabled || code == g_valid) return false;
+    if (code == 0xFF) return false;
+    return (code == kCodes[kOutsideBuildArea].code ? cfg.buildAnywhere != 0 : g_relax[code]) ||
+           (!cfg.objectSnap && (code == kCodes[kNoSnap].code || code == kCodes[kNoSnapFloor].code));
+}
 
 static bool Relax(void* root, int site)
 {
     uint8_t& code = *((uint8_t*)root + cfg.statusOffset);
+    bool relax = WouldRelax(code);
     if (g_verbose) {
         static uint8_t last[2] = { 0xFF, 0xFF };
         if (code != last[site]) {
-            Log("[%s] code %u%s", site ? "Update" : "Evaluate", code,
-                (code != g_valid && g_relax[code]) ? (cfg.enabled ? " -> relaxed" : " (relaxable, mod off)") : "");
+            Log("[%s] code %u%s", site ? "Update" : "Evaluate", code, relax ? " -> relaxed" : "");
             last[site] = code;
         }
     }
-    if (!cfg.enabled || code == g_valid) return false;
-    bool relax = g_relax[code] || (!cfg.objectSnap && code != 0xFF &&
-                                   (code == kCodes[kNoSnap].code || code == kCodes[kNoSnapFloor].code));
     if (relax) code = g_valid;
     return relax;
 }
 
-static char Hook_EvaluatePlacement(void* root, void* a2, void* a3, void* a4)
+// The foundation check in UpdatePlacementStatus sets Intersecting / FoundationTooTall and colours
+// the preview red straight away (highlight(root, invalid=1)), before Relax runs - so a relaxed
+// structure still showed red. That one call is told "valid" when the code will be relaxed.
+static void (*g_Highlight)(void*, void*, char, char) = nullptr;
+
+static void Hook_Highlight(void* a1, void* root, char invalid, char a4)
+{
+    if (invalid && root && WouldRelax(*((uint8_t*)root + cfg.statusOffset))) invalid = 0;
+    g_Highlight(a1, root, invalid, a4);
+}
+
+// WORKSHOP BOUNDARY off: three checks return OutsideBuildArea and skip the rest of their work -
+// ValidatePlacement (item), and the surface / follow-camera cast handlers (crosshair point; on
+// failure UpdatePlacementStatus skips updating the held item, which then vanishes). Relaxing the
+// code afterwards can't undo that, so those calls to the build-area test answer "inside" instead.
+// The fourth is the player check behind the "outside the build area" countdown that exits build mode.
+static char (*g_InBuildArea[4])(void*, void*, void*, void*) = {};
+
+template <int N> static char Hook_InBuildArea(void* ws, void* item, void* area, void* a4)
+{
+    char r = g_InBuildArea[N](ws, item, area, a4);
+    return (!r && cfg.enabled && cfg.buildAnywhere && kCodes[kOutsideBuildArea].code != 0xFF) ? 1 : r;
+}
+
+template <int N> static char Hook_EvaluatePlacement(void* root, void* a2, void* a3, void* a4)
 {
     if (!g_pollByTask) PollKeys();
-    char ok = g_EvaluatePlacement(root, a2, a3, a4);
+    char ok = g_EvaluatePlacement[N](root, a2, a3, a4);
     return (root && Relax(root, 0)) ? 1 : ok;
 }
 
-static void Hook_UpdatePlacementStatus(void* root)
+// ================================================================ rotate with view
+// The held item's yaw is root+0x184 (radians, same convention as a ref's angle z). At the start of
+// each UpdatePlacementStatus the game re-reads it from the item's current world rotation
+// (yaw = -atan2(...) or atan2(...) at two call sites, then stored); later in the update the rotate
+// keys add their input and snapping can override it. So the item stays fixed in the world when the
+// player turns. Rotate with view keeps its own yaw for the held item: before each update it adds the
+// player's turn and makes the two re-reads return it; after the update it takes the game's result
+// (rotate keys, snapping) as its new own yaw. So the item keeps its angle relative to the view, like
+// Fallout 4. Starfield Engine Fixes gets the same effect by removing the re-read store; here no game
+// code is changed, the toggle works live and the rotate keys keep working. Snapped items are left alone.
+static uint8_t** g_player = nullptr;   // PlayerCharacter*; heading (angle z, radians) at +0x88
+static uint32_t  g_yawOffset = 0;
+static uint32_t  g_snappedOffset = 0;  // byte: item is snapped to another piece
+static uint8_t*  g_yawStore = nullptr; // the game's yaw re-read store, checked for other plugins
+static uint8_t   g_yawStoreOrig[13];
+static float     (*g_yawRead[2])(float, float) = {};   // the two re-read atan2 calls
+static float     g_ownYaw = 0;
+static bool      g_rotReady = false;   // re-reads hooked and nothing else changes the yaw code
+static DWORD     g_rotThread = 0;      // set while an update with an active override runs
+static constexpr float kPi = 3.14159265f;
+
+// Wrap to [-pi, pi]. Bounded for any input (no loops); non-finite values become 0.
+static float WrapPi(float a)
 {
-    g_UpdatePlacementStatus(root);
-    if (root) Relax(root, 1);
+    if (!std::isfinite(a)) return 0.0f;
+    a = remainderf(a, 2 * kPi);
+    return a > kPi ? a - 2 * kPi : a < -kPi ? a + 2 * kPi : a;
+}
+
+// The re-read value is the item's world rotation. It isn't updated with our yaw, only by the rotate
+// keys, so a change in it is a key turn: add that change to our yaw (adopting the value itself
+// would jump back to the old world angle first).
+static bool  g_haveNatural = false;   // cleared for a new item
+static float OwnYaw(float natural)
+{
+    static float lastNatural = 0;
+    if (!std::isfinite(natural)) return g_ownYaw;
+    if (!g_haveNatural) { g_ownYaw = natural; g_haveNatural = true; }
+    else g_ownYaw = WrapPi(g_ownYaw + WrapPi(natural - lastNatural));
+    lastNatural = natural;
+    return g_ownYaw;
+}
+static float Hook_YawReadNeg(float a, float b)   // stored negated: yaw = -ret
+{
+    float r = g_yawRead[0](a, b);
+    return g_rotThread == GetCurrentThreadId() ? -OwnYaw(WrapPi(-r)) : r;
+}
+static float Hook_YawRead(float a, float b)      // stored as is: yaw = ret
+{
+    float r = g_yawRead[1](a, b);
+    return g_rotThread == GetCurrentThreadId() ? OwnYaw(WrapPi(r)) : r;
+}
+
+// Before the update: true if this update gets the override. The held item keeps our yaw whether or
+// not rotate with view is on (so its angle persists when the toggle changes); only the player's
+// turn is added when it is on.
+static bool RotateBefore(void* root)
+{
+    static void* lastRoot = nullptr;
+    static ULONGLONG lastTick = 0;
+    static float heading = 0;
+    uint8_t* player = g_player ? *g_player : nullptr;
+    if (!root || !player || !g_yawOffset) return false;
+    float h = *(float*)(player + 0x88);
+    if (!(h > -10.0f && h < 10.0f)) return false;   // not a heading
+    ULONGLONG now = GetTickCount64();
+    bool fresh = root != lastRoot || now - lastTick > 250;   // new item / first update after a gap
+    bool snapped = g_snappedOffset && *((uint8_t*)root + g_snappedOffset);
+    float turn = WrapPi(h - heading);
+    heading = h; lastRoot = root; lastTick = now;
+    if (fresh) g_haveNatural = false;
+    if (fresh || snapped || !g_rotReady) return false;
+    if (cfg.rotateWithView) g_ownYaw = WrapPi(g_ownYaw + turn);
+    *(float*)((uint8_t*)root + g_yawOffset) = g_ownYaw;
+    return true;
+}
+
+static void RestoreGroundType(void* root);   // surface snapping
+
+template <int N> static void Hook_UpdatePlacementStatus(void* root)
+{
+    if (root) { g_heldRoot = root; g_heldTick = GetTickCount64(); }
+    bool rotate = RotateBefore(root);
+    if (rotate) g_rotThread = GetCurrentThreadId();
+    g_UpdatePlacementStatus[N](root);
+    g_rotThread = 0;
+    RestoreGroundType(root);
+    if (root) {
+        Relax(root, 1);
+        if (g_yawOffset) g_ownYaw = *(float*)((uint8_t*)root + g_yawOffset);   // keys / snapping / fresh item
+    }
 }
 
 // ================================================================ object snapping
 // GetSnapCandidates builds the list of snap points the held item can attach to; an empty list
 // is a normal state the game handles.
-static int64_t* (*g_GetSnapCandidates)(int64_t*, void*, void*, void*) = nullptr;
+static int64_t* (*g_GetSnapCandidates[8])(int64_t*, void*, void*, void*) = {};
 
-static int64_t* Hook_GetSnapCandidates(int64_t* out, void* root, void* a3, void* a4)
+template <int N> static int64_t* Hook_GetSnapCandidates(int64_t* out, void* root, void* a3, void* a4)
 {
     if (!cfg.objectSnap) { out[0] = out[1] = out[2] = 0; return out; }
-    return g_GetSnapCandidates(out, root, a3, a4);
+    return g_GetSnapCandidates[N](out, root, a3, a4);
 }
 
 // ================================================================ foundations
@@ -399,15 +613,16 @@ static int64_t* Hook_GetSnapCandidates(int64_t* out, void* root, void* a3, void*
 // AutoFoundationHeight also sets the "foundation too tall" flag (status-1) from its height
 // cast, and the game colours the preview red from it before our wrappers run, so that one
 // flag write is NOP'd while No More Red relaxes FoundationTooTall or foundations are off.
-static uint32_t (*g_FoundationCount)(void*, void*, float, char, void*, float*) = nullptr;
+static uint32_t (*g_FoundationCount[8])(void*, void*, float, char, void*, float*) = {};
 static uint8_t* g_tooTallWrite = nullptr;
 static uint8_t  g_tooTallOrig[8];
 static bool     g_tooTallNopped = false;
 
+template <int N>
 static uint32_t Hook_FoundationCount(void* data, void* parts, float height, char flag, void* a5, float* outHeight)
 {
     if (!cfg.foundations && outHeight) { *outHeight = 0.0f; return 0; }
-    return g_FoundationCount(data, parts, height, flag, a5, outHeight);
+    return g_FoundationCount[N](data, parts, height, flag, a5, outHeight);
 }
 
 static void UpdateTooTallPatch()
@@ -423,18 +638,17 @@ static void UpdateTooTallPatch()
 // Precise Placement holds the item in front of the camera but stops it at whatever the
 // crosshair cast (SurfaceCast, ItemPlacementForwardCastCollector) hits. Surface snapping off:
 // the collector's AddHit drops every hit while SurfaceCast runs, so the item stays at its hold
-// distance; the cast then misses, and on a miss the drop-to-ground pass is skipped by storing
-// hit normal.z = 0 instead of FLT_MAX. Some items (structures) force the drop pass anyway, so
+// distance; SurfaceCast still returns 0 (no placement error), and the drop-to-ground pass is then
+// skipped by storing hit normal.z = 0 instead of FLT_MAX. Some items (structures) force the drop pass anyway, so
 // after it runs the ground type it stored is cleared; UpdatePlacementStatus only clamps the
-// item's height to the ground for ground types 1/2/6. SurfaceCast also tells us which item is held.
-static uint64_t (*g_SurfaceCast)(void*, void*) = nullptr;
+// item's height to the ground for ground types 1/2/6.
+static uint64_t (*g_SurfaceCast[8])(void*, void*) = {};
 static void     (*g_AddHit)(void*, void*) = nullptr;
+static uint8_t** g_addHitSlot = nullptr;
 static uint32_t  g_normalZOffset = 0;
 static DWORD     g_castThread = 0;
-static void     (*g_DropToGround)(void*, void*, void*) = nullptr;
+static void     (*g_DropToGround[8])(void*, void*, void*) = {};
 static uint32_t  g_groundTypeOffset = 0;
-static void*     g_heldRoot = nullptr;
-static ULONGLONG g_heldTick = 0;
 
 static void Hook_AddHit(void* collector, void* hit)
 {
@@ -442,22 +656,35 @@ static void Hook_AddHit(void* collector, void* hit)
     g_AddHit(collector, hit);
 }
 
-static uint64_t Hook_SurfaceCast(void* root, void* a2)
+template <int N> static uint64_t Hook_SurfaceCast(void* root, void* a2)
 {
-    g_heldRoot = root;
-    g_heldTick = GetTickCount64();
     g_castThread = GetCurrentThreadId();
-    uint64_t hit = g_SurfaceCast(root, a2);
+    uint64_t hit = g_SurfaceCast[N](root, a2);
     g_castThread = 0;
     if (!cfg.surfaceSnap && root && (hit & 0xFF) == 0)
         *(float*)((uint8_t*)root + g_normalZOffset) = 0.0f;
     return hit;
 }
 
-static void Hook_DropToGround(void* root, void* a2, void* a3)
+// The ground type is cleared only for the rest of UpdatePlacementStatus (where the height clamp
+// reads it) and put back afterwards: building the auto-foundation on commit needs it.
+static void*   g_groundRoot = nullptr;
+static uint8_t g_groundSaved = 0;
+
+static void RestoreGroundType(void* root)
 {
-    g_DropToGround(root, a2, a3);   // also releases the refs passed in a2/a3, so always call it
-    if (!cfg.surfaceSnap && root) *((uint8_t*)root + g_groundTypeOffset) = 0;
+    if (root && root == g_groundRoot) *((uint8_t*)root + g_groundTypeOffset) = g_groundSaved;
+    g_groundRoot = nullptr;
+}
+
+template <int N> static void Hook_DropToGround(void* root, void* a2, void* a3)
+{
+    g_DropToGround[N](root, a2, a3);   // also releases the refs passed in a2/a3, so always call it
+    if (!cfg.surfaceSnap && root) {
+        uint8_t& type = *((uint8_t*)root + g_groundTypeOffset);
+        if (type) { g_groundRoot = root; g_groundSaved = type; }
+        type = 0;
+    }
 }
 
 // ================================================================ hold distance
@@ -488,17 +715,45 @@ static void AdjustHoldDistance(float dir)
     }
 }
 
+// Fine rotate: turn the held item's own yaw by a step; the next update applies it. Not for pieces
+// snapped to another piece (the game sets their yaw from the snap point).
+static void FineRotate(float dir)
+{
+    if (!g_rotReady || !g_heldRoot || GetTickCount64() - g_heldTick > 500) return;   // nothing held
+    if (g_snappedOffset && *((uint8_t*)g_heldRoot + g_snappedOffset)) return;
+    g_ownYaw = WrapPi(g_ownYaw + dir * cfg.fineStep * (kPi / 180.0f));
+}
+
 // ================================================================ hotkeys
 // Polled once per frame on the main thread by an SFSE task; keys only act while the game has
 // focus, but their state is tracked regardless so alt-tabbing back with a key held isn't a press.
-struct Toggle { Key* key; volatile LONG* state; const char* label; bool available; void (*changed)(); };
+// `invert`: the HUD shows the opposite of the state (WORKSHOP BOUNDARY: OFF = build anywhere on).
+struct Toggle { Key* key; volatile LONG* state; const char* label; bool available; void (*changed)(); bool invert; };
 static Toggle g_toggles[] = {
     { &cfg.kEnabled,     &cfg.enabled,     "NO MORE RED",      false, UpdateTooTallPatch },
     { &cfg.kObjectSnap,  &cfg.objectSnap,  "OBJECT SNAPPING",  false, nullptr },
     { &cfg.kSurfaceSnap, &cfg.surfaceSnap, "SURFACE SNAPPING", false, nullptr },
     { &cfg.kFoundations, &cfg.foundations, "FOUNDATIONS",      false, UpdateTooTallPatch },
+    { &cfg.kBuildAnywhere, &cfg.buildAnywhere, "WORKSHOP BOUNDARY", false, nullptr, true },
+    { &cfg.kRotate,      &cfg.rotateWithView, "ROTATE WITH VIEW", false, nullptr },
 };
-enum { kToggleEnabled, kToggleObjectSnap, kToggleSurfaceSnap, kToggleFoundations };
+enum { kToggleEnabled, kToggleObjectSnap, kToggleSurfaceSnap, kToggleFoundations, kToggleBuildAnywhere, kToggleRotate };
+
+// Build mode = the game's WorkshopMenu is open: UI::IsMenuOpen(UI singleton, WorkshopMenu name).
+// If that can't be verified at startup, hotkeys work everywhere as before.
+static struct {
+    void** ui = nullptr;
+    bool (*isOpen)(void*, void*) = nullptr;
+    void* (*name)() = nullptr;
+} g_menu;
+
+static bool InBuildMode()
+{
+    if (!g_menu.isOpen) return true;
+    void* ui = *g_menu.ui;
+    void* name = ui ? g_menu.name() : nullptr;
+    return name && g_menu.isOpen(ui, name);
+}
 
 // Fires on press; with `repeat`, again every 50 ms after 300 ms held.
 static bool Fired(Key& k, bool repeat)
@@ -513,21 +768,85 @@ static bool Fired(Key& k, bool repeat)
     return fire;
 }
 
+// ---- modifier keys: the distance / fine rotate keys only act with the modifier (Ctrl) held, and
+// while it is held in build mode the game doesn't get those keys (its menus would navigate with
+// the arrows). The game reads the keyboard with raw input (USER32 GetRawInputData, one import);
+// that import is redirected and, while blocking, those keys' events come back as "no key".
+static volatile bool g_blockKeys = false;
+static UINT (WINAPI* g_GetRawInputData)(HRAWINPUT, UINT, LPVOID, PUINT, UINT) = nullptr;
+static void** g_rawInputSlot = nullptr;
+
+static UINT WINAPI Hook_GetRawInputData(HRAWINPUT h, UINT cmd, LPVOID data, PUINT size, UINT header)
+{
+    UINT r = g_GetRawInputData(h, cmd, data, size, header);
+    if (cmd != RID_INPUT || !data || r == (UINT)-1 || r < sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)) return r;
+    RAWINPUT* ri = (RAWINPUT*)data;
+    if (ri->header.dwType != RIM_TYPEKEYBOARD || !ri->data.keyboard.VKey) return r;
+    const int vk = ri->data.keyboard.VKey, keys[4] = { cfg.kFarther.vk, cfg.kCloser.vk, cfg.kFineLeft.vk, cfg.kFineRight.vk };
+    static bool swallowed[4] = {};   // key-down was hidden, so hide its key-up too (and only then)
+    for (int i = 0; i < 4; ++i) {
+        if (vk != keys[i]) continue;
+        bool up = (ri->data.keyboard.Flags & RI_KEY_BREAK) != 0;
+        bool hide = up ? swallowed[i] : g_blockKeys;
+        if (!up) swallowed[i] = hide;
+        else swallowed[i] = false;
+        if (hide) { ri->data.keyboard.VKey = 0xFF; ri->data.keyboard.MakeCode = 0; }
+        break;
+    }
+    return r;
+}
+
+// The exe's import slot for USER32!GetRawInputData.
+static void** FindImport(const char* dll, const char* fn)
+{
+    uint8_t* base = ExeBase();
+    auto nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return nullptr;
+    for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp) {
+        if (_stricmp((const char*)(base + imp->Name), dll) || !imp->OriginalFirstThunk) continue;
+        auto names = (IMAGE_THUNK_DATA64*)(base + imp->OriginalFirstThunk);
+        auto slots = (IMAGE_THUNK_DATA64*)(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots)
+            if (!IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) &&
+                !strcmp((const char*)((IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData))->Name, fn))
+                return (void**)&slots->u1.Function;
+    }
+    return nullptr;
+}
+
+static bool ModifierDown() { return !cfg.modifier || (GetAsyncKeyState(cfg.modifier) & 0x8000); }
+
 static void PollKeys()
 {
+    // Every key's state is read every poll so a key held from before never counts as a press.
+    bool fired[sizeof(g_toggles) / sizeof(g_toggles[0])], any = false;
+    for (size_t i = 0; i < sizeof(g_toggles) / sizeof(g_toggles[0]); ++i) any |= fired[i] = Fired(*g_toggles[i].key, false);
+    bool mod = ModifierDown();
+    bool farther = Fired(cfg.kFarther, true) && mod, closer = Fired(cfg.kCloser, true) && mod;
+    bool left = Fired(cfg.kFineLeft, true) && mod, right = Fired(cfg.kFineRight, true) && mod;
+
+    bool act = any || farther || closer || left || right;
+    bool wantBlock = g_rawInputSlot && cfg.modifier && mod;
+    if (!act && !wantBlock) { g_blockKeys = false; return; }
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-    bool focused = pid == GetCurrentProcessId();
-    for (auto& t : g_toggles) {
-        if (!Fired(*t.key, false) || !focused || !t.available) continue;
+    bool ready = pid == GetCurrentProcessId() && InBuildMode();   // focused, in build mode
+    g_blockKeys = wantBlock && ready;
+    if (!act || !ready) return;
+    for (size_t i = 0; i < sizeof(g_toggles) / sizeof(g_toggles[0]); ++i) {
+        Toggle& t = g_toggles[i];
+        if (!fired[i] || !t.available) continue;
         bool on = (InterlockedXor(t.state, 1) ^ 1) != 0;
         if (t.changed) t.changed();
         char msg[64];
-        snprintf(msg, sizeof(msg), "%s: %s", t.label, on ? "ON" : "OFF");
+        snprintf(msg, sizeof(msg), "%s: %s", t.label, (on != t.invert) ? "ON" : "OFF");
         ShowHUD(msg);
     }
-    if (Fired(cfg.kFarther, true) && focused) AdjustHoldDistance(+1.0f);
-    if (Fired(cfg.kCloser, true) && focused)  AdjustHoldDistance(-1.0f);
+    if (farther) AdjustHoldDistance(+1.0f);
+    if (closer)  AdjustHoldDistance(-1.0f);
+    if (left)    FineRotate(-1.0f);
+    if (right)   FineRotate(+1.0f);
 }
 
 // SFSE ITaskDelegate with a hand-built vtable (Run, Destroy), independent of compiler ABI.
@@ -590,8 +909,10 @@ static void ResolveCodes()
     } else Log("code table: could not read the game's table - using 1.16.244 numbers unverified");
 
     for (auto& c : kCodes) {
-        if (c.code != 0xFF) g_relax[c.code] = c.want;
-        Log("  [%3u] %-22s %s  (%s)", c.code, c.key, (c.code != 0xFF && c.want) ? "RELAX" : "keep ", c.desc);
+        bool boundary = &c == &kCodes[kOutsideBuildArea];
+        if (c.code != 0xFF && !boundary) g_relax[c.code] = c.want;
+        Log("  [%3u] %-22s %s  (%s)", c.code, c.key,
+            boundary ? "WORKSHOP BOUNDARY toggle" : (c.code != 0xFF && c.want) ? "RELAX" : "keep ", c.desc);
     }
 }
 
@@ -615,31 +936,72 @@ static bool Install(uint32_t runtime)
     if (!AllocStubs()) { Log("could not allocate stub memory near the exe - nothing patched"); return false; }
 
     // No More Red (required)
-    g_EvaluatePlacement     = (decltype(g_EvaluatePlacement))fEval;
-    g_UpdatePlacementStatus = (decltype(g_UpdatePlacementStatus))fUpd;
-    if (!Hookable(fEval) || !Hookable(fUpd)) {   // check both before patching either
+    if (!Hookable(fEval) || !Hookable(fUpd)) {   // check both before planning either
         Log("core functions have unexpected callers (%d / %d) - nothing patched",
             Callers(fEval) ? Callers(fEval)->count : 0, Callers(fUpd) ? Callers(fUpd)->count : 0);
         return false;
     }
-    HookCalls("EvaluatePlacement", fEval, (void*)&Hook_EvaluatePlacement, 2);
-    HookCalls("UpdatePlacementStatus", fUpd, (void*)&Hook_UpdatePlacementStatus, 2);
-    g_toggles[kToggleEnabled].available = true;
+    static void* const wEval[] = SITE_WRAPPERS(Hook_EvaluatePlacement);
+    static void* const wUpd[]  = SITE_WRAPPERS(Hook_UpdatePlacementStatus);
+    HookCalls("EvaluatePlacement", fEval, wEval, (void**)g_EvaluatePlacement, 2);
+    HookCalls("UpdatePlacementStatus", fUpd, wUpd, (void**)g_UpdatePlacementStatus, 2);
+    g_toggles[kToggleEnabled].available = g_toggles[kToggleBuildAnywhere].available = true;
+
+    // foundation check's red highlight: `mov [r14+status],al; xor r9d,r9d; mov r8b,1; mov rdx,r14; call highlight`
+    if (uint8_t* m = Scan(fUpd, 0x1400, "41 88 86 ?? ?? ?? ?? 45 33 C9 41 B0 01 49 8B D6 E8"))
+        Log(U32(m + 3) == cfg.statusOffset && HookOneCall("foundation highlight", m + 16, (void*)&Hook_Highlight, (void**)&g_Highlight)
+            ? "foundations: red highlight call hooked" : "foundations: red highlight call not hooked");
+    else Log("foundations: red highlight call not found");
+
+    // WORKSHOP BOUNDARY: in each function, the call to the build-area test that is followed by
+    // "status = OutsideBuildArea" (`mov byte ptr [reg+status],N` / `mov al,N` / `mov dil,N`)
+    {
+        static void* const wArea[] = { (void*)&Hook_InBuildArea<0>, (void*)&Hook_InBuildArea<1>, (void*)&Hook_InBuildArea<2> };
+        const struct { uint32_t fn, callee, len; const char* name; } checks[3] = {
+            { ID::ValidatePlacement, ID::IsInBuildArea,      0x200, "ValidatePlacement" },
+            { ID::PlaceOnSurface,    ID::IsPointInBuildArea, 0x800, "surface cast" },
+            { ID::PlaceFollowCamera, ID::IsPointInBuildArea, 0x200, "follow-camera cast" },
+        };
+        uint8_t c10 = kCodes[kOutsideBuildArea].code;
+        int hooked = 0;
+        for (int k = 0; k < 3; ++k) {
+            uint8_t *f = Code(checks[k].fn), *callee = Code(checks[k].callee), *site = nullptr;
+            for (uint8_t* q = f; f && callee && c10 != 0xFF && q + 0x30 <= f + checks[k].len && !site; ++q) {
+                if (q[0] != 0xE8 || q + 5 + I32(q + 1) != callee) continue;
+                for (uint8_t* m = q + 5; m < q + 0x30 && !site; ++m)
+                    if ((m[0] == 0x41 && m[1] == 0xC6 && (m[2] & 0xF8) == 0x80 && U32(m + 3) == cfg.statusOffset && m[7] == c10) ||
+                        (m[0] == 0xB0 && m[1] == c10) || (m[0] == 0x40 && m[1] == 0xB7 && m[2] == c10)) site = q;
+            }
+            bool ok = site && HookOneCall("workshop boundary: build area test", site, wArea[k], (void**)&g_InBuildArea[k]);
+            hooked += ok;
+            if (!ok) Log("workshop boundary: %s build area check not found", checks[k].name);
+        }
+        Log("workshop boundary: %d of 3 build area checks hooked", hooked);
+
+        // player outside-area timer: `lea r8,[rbx+area]; mov rdx,[rip+player]; call IsInBuildArea`
+        uint8_t *f = Code(ID::PlayerOutsideTimer), *callee = Code(ID::IsInBuildArea), *site = nullptr;
+        uint8_t* player = Addr(ID::PlayerSingleton);
+        for (uint8_t* q = f; f && callee && player && q + 12 <= f + 0x80 && !site; ++q)
+            if (q[0] == 0x48 && q[1] == 0x8B && q[2] == 0x15 && q + 7 + I32(q + 3) == player &&
+                q[7] == 0xE8 && q + 12 + I32(q + 8) == callee) site = q + 7;
+        static void* const wTimer = (void*)&Hook_InBuildArea<3>;
+        Log(site && HookOneCall("workshop boundary: player timer", site, wTimer, (void**)&g_InBuildArea[3])
+            ? "workshop boundary: outside-area timeout hooked" : "workshop boundary: outside-area timeout not found");
+    }
 
     // object snapping
-    g_GetSnapCandidates = (decltype(g_GetSnapCandidates))fSnap;
+    static void* const wSnap[] = SITE_WRAPPERS(Hook_GetSnapCandidates);
     g_toggles[kToggleObjectSnap].available =
-        fSnap && HookCalls("object snapping: GetSnapCandidates", fSnap, (void*)&Hook_GetSnapCandidates, 2);
+        fSnap && HookCalls("object snapping: GetSnapCandidates", fSnap, wSnap, (void**)g_GetSnapCandidates, 2);
 
     // foundations: piece count hook + "too tall" flag write (status-1, right before the status byte)
-    g_FoundationCount = (decltype(g_FoundationCount))fCount;
+    static void* const wCount[] = SITE_WRAPPERS(Hook_FoundationCount);
     g_toggles[kToggleFoundations].available =
-        fCount && HookCalls("foundations: FoundationCount", fCount, (void*)&Hook_FoundationCount, 3);
+        fCount && HookCalls("foundations: FoundationCount", fCount, wCount, (void**)g_FoundationCount, 3);
     if (uint8_t* f = Code(ID::AutoFoundationHeight))
         if (uint8_t* m = Scan(f, 0x600, "80 7D ?? 00 74 08 41 C6 87 ?? ?? ?? ?? 01"))
             if (U32(m + 9) == cfg.statusOffset - 1) { g_tooTallWrite = m + 6; memcpy(g_tooTallOrig, g_tooTallWrite, 8); }
     Log(g_tooTallWrite ? "foundation too tall: flag write at %p" : "foundation too tall: flag write not found", g_tooTallWrite);
-    UpdateTooTallPatch();
 
     // surface snapping: AddHit vtable slot + normal.z offset + SurfaceCast call site
     uint8_t* vtbl = Addr(ID::ForwardCastVtbl);
@@ -655,25 +1017,23 @@ static bool Install(uint32_t runtime)
             else if (a == posZ + 4) { g_normalZOffset = b; break; }
         }
         Log("surface snapping: normal.z offset 0x%X", g_normalZOffset);
-        g_SurfaceCast = (decltype(g_SurfaceCast))fCast;
-        if (g_normalZOffset && HookCalls("surface snapping: SurfaceCast", fCast, (void*)&Hook_SurfaceCast, 1)) {
+        static void* const wCast[] = SITE_WRAPPERS(Hook_SurfaceCast);
+        static void* const wDrop[] = SITE_WRAPPERS(Hook_DropToGround);
+        if (g_normalZOffset && HookCalls("surface snapping: SurfaceCast", fCast, wCast, (void**)g_SurfaceCast, 1)) {
             g_AddHit = (decltype(g_AddHit))fAdd;
-            void* hook = (void*)&Hook_AddHit;
-            Patch(vtbl + 4 * 8, &hook, 8);
+            g_addHitSlot = (uint8_t**)(vtbl + 4 * 8);   // patched in ApplyDeferred
             g_toggles[kToggleSurfaceSnap].available = true;
             // ground clamp: `movzx ecx,byte ptr [r14+X]; lea eax,[rcx-1]; test al,0FAh` after the drop pass
             if (uint8_t* m = Scan(fUpd, 0x1400, "41 0F B6 8E ?? ?? ?? ?? 8D 41 FF A8 FA")) g_groundTypeOffset = U32(m + 4);
-            g_DropToGround = (decltype(g_DropToGround))fDrop;
             Log("surface snapping: ground type offset 0x%X", g_groundTypeOffset);
             if (!fDrop || !g_groundTypeOffset || g_groundTypeOffset >= 0x2000 ||
-                !HookCalls("surface snapping: DropToGround", fDrop, (void*)&Hook_DropToGround, 3))
+                !HookCalls("surface snapping: DropToGround", fDrop, wDrop, (void**)g_DropToGround, 3))
                 Log("surface snapping: ground clamp not hooked (items that force a drop may still settle)");
         }
     } else Log("surface snapping: collector vtable/AddHit not found");
 
     // hold distance: `vmovss xmm0,[rcx+X]; vmovss xmm2,[rcx+X+4]; vmovss xmm3,[rcx+X+8]`
-    // (needs the SurfaceCast hook to know which item is held)
-    if (uint8_t* f = Code(ID::FollowCamCastLength); f && g_toggles[kToggleSurfaceSnap].available)
+    if (uint8_t* f = Code(ID::FollowCamCastLength))
         if (uint8_t* m = Scan(f, 0x100, "C5 FA 10 81 ?? ?? ?? ?? C5 ?? 10 91 ?? ?? ?? ?? C5 ?? 10 99"))
             if (U32(m + 12) == U32(m + 4) + 4 && U32(m + 20) == U32(m + 4) + 8 && U32(m + 4) < 0x2000)
                 g_holdOffset = U32(m + 4);
@@ -696,7 +1056,132 @@ static bool Install(uint32_t runtime)
         hud.functorVtbl = vt;
     }
     Log(hud.source ? "HUD messages ready" : "HUD messages unavailable");
+
+    // build mode check for hotkeys: the name getter must load the "WorkshopMenu" string
+    uint8_t *ui = Addr(ID::UISingleton), *isOpen = Code(ID::IsMenuOpen), *nameFn = Code(ID::WorkshopMenuName);
+    uint8_t* lea = nameFn ? Scan(nameFn, 0x80, "48 8D 15") : nullptr;
+    const char* str = lea ? (const char*)(lea + 7 + I32(lea + 3)) : nullptr;
+    if (ui && isOpen && str && !IsBadReadPtr(str, 13) && !strcmp(str, "WorkshopMenu")) {
+        g_menu.ui = (void**)ui;
+        g_menu.isOpen = (decltype(g_menu.isOpen))isOpen;
+        g_menu.name = (decltype(g_menu.name))nameFn;
+    }
+    Log(g_menu.isOpen ? "hotkeys: build mode only (WorkshopMenu)" : "hotkeys: build mode check not found - keys work everywhere");
+
+    // rotate with view: the follow-camera yaw store `vxorps xmm0,xmm0,xmm6; vmovss [r14+X],xmm0`
+    if (uint8_t* m = Scan(fUpd, 0x800, "C5 F8 57 C6 C4 C1 7A 11 86 ?? ?? ?? ??"))
+        if (U32(m + 9) < 0x2000) { g_yawOffset = U32(m + 9); g_yawStore = m; memcpy(g_yawStoreOrig, m, sizeof(g_yawStoreOrig)); }
+    g_player = (uint8_t**)Addr(ID::PlayerSingleton);
+    // snapped flag: in the snap handler, `cmp byte ptr [r14+X],0; je; vmovss xmm0,[rsp+..];
+    // vaddss xmm1,xmm0,[r14+70h]; vmovss [r14+yaw],xmm1` (snap yaw + rotate input)
+    if (CallerSet* cs = Callers(fSnap); cs && cs->count && g_yawOffset)
+        if (uint8_t* m = Scan(cs->sites[0] - 0x600, 0x600,
+                              "41 80 BE ?? ?? ?? ?? 00 0F 84 ?? ?? ?? ?? C5 FA 10 44 24 ?? C4 C1 7A 58 4E 70 C4 C1 7A 11 8E"))
+            if (U32(m + 31) == g_yawOffset && U32(m + 3) < 0x2000) g_snappedOffset = U32(m + 3);
+    // re-read calls: `call atan2; vxorps; <store>` right before the store, and `call atan2; jmp <store>`
+    bool reads = false;
+    if (g_yawStore && g_yawStore[-5] == 0xE8) {
+        uint8_t* atan = g_yawStore + I32(g_yawStore - 4);
+        uint8_t* other = nullptr;
+        for (uint8_t* q = fUpd; q + 10 <= fUpd + 0x1400 && !other; ++q)
+            if (q != g_yawStore - 5 && q[0] == 0xE8 && q + 5 + I32(q + 1) == atan &&
+                ((q[5] == 0xEB && q + 7 + (int8_t)q[6] == g_yawStore + 4) ||
+                 (q[5] == 0xE9 && q + 10 + I32(q + 6) == g_yawStore + 4))) other = q;
+        reads = other && HookOneCall("rotate with view: yaw re-read", g_yawStore - 5, (void*)&Hook_YawReadNeg, (void**)&g_yawRead[0]) &&
+                HookOneCall("rotate with view: yaw re-read", other, (void*)&Hook_YawRead, (void**)&g_yawRead[1]);
+    }
+    g_toggles[kToggleRotate].available = g_rotReady = g_yawOffset && g_player && reads;
+    Log("rotate with view: yaw 0x%X, snapped flag 0x%X, player %s, yaw re-reads %s", g_yawOffset,
+        g_snappedOffset, g_player ? "found" : "missing", reads ? "hooked" : "not found");
     return true;
+}
+
+// Starfield Engine Fixes' Unrestricted Build Mode Placement makes every placement VALID inside
+// the call No More Red wraps, so with it on the [Relax] list and the toggle can't block anything.
+static void CheckOtherPlugins()
+{
+    if (!GetModuleHandleA("StarfieldEngineFixes.dll")) return;
+    char ini[MAX_PATH];
+    snprintf(ini, sizeof(ini), "%sStarfieldEngineFixes.ini", g_dir);
+    bool unrestricted = GetPrivateProfileIntA("Settings", "bUnrestrictedBuildModePlacement", 0, ini) != 0;
+
+    Log("Starfield Engine Fixes loaded, bUnrestrictedBuildModePlacement=%d%s", unrestricted,
+        unrestricted ? " - it allows every placement, so No More Red's [Relax] settings and toggle can't"
+                       " block anything. Set it to 0 to use No More Red's codes." : "");
+}
+
+// Everything that touches game code or data another plugin might also change is applied here,
+// after all plugins have loaded. Whatever another plugin already hooked is chained; whatever it
+// replaced outright is left alone and the No More Red feature that needed it is turned off.
+static void ApplyDeferred()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    ApplyCallHooks();
+
+    // modifier key blocking: chain to whatever the game's GetRawInputData import points at now
+    if (cfg.modifier) {
+        void** slot = FindImport("USER32.dll", "GetRawInputData");
+        if (slot && Executable(*slot)) {
+            char name[MAX_PATH];
+            g_GetRawInputData = (decltype(g_GetRawInputData))*slot;
+            void* hook = (void*)&Hook_GetRawInputData;
+            Patch(slot, &hook, 8);
+            g_rawInputSlot = slot;
+            Log("modifier keys: raw input hooked (calls %s)", OwnerOf((uint8_t*)g_GetRawInputData, name, sizeof(name)));
+        } else Log("modifier keys: raw input import not found - arrow keys will also reach the game");
+    }
+
+    if (g_addHitSlot) {
+        uint8_t* cur = *g_addHitSlot;
+        char name[MAX_PATH];
+        if (cur != (uint8_t*)g_AddHit && Executable(cur)) {
+            Log("surface snapping: AddHit already hooked by %s - chaining to it", OwnerOf(cur, name, sizeof(name)));
+            g_AddHit = (decltype(g_AddHit))cur;
+        } else if (cur != (uint8_t*)g_AddHit) {
+            Log("surface snapping: AddHit was replaced by another plugin - surface snapping toggle disabled");
+            g_addHitSlot = nullptr;
+            g_toggles[kToggleSurfaceSnap].available = false;
+            cfg.surfaceSnap = 1;
+        }
+        if (g_addHitSlot) { void* hook = (void*)&Hook_AddHit; Patch(g_addHitSlot, &hook, 8); }
+    }
+
+    if (g_tooTallWrite && memcmp(g_tooTallWrite, g_tooTallOrig, sizeof(g_tooTallOrig))) {
+        Log("foundation too tall: flag write was changed by another plugin - left alone");
+        g_tooTallWrite = nullptr;
+    }
+    UpdateTooTallPatch();
+
+    if (g_yawStore && memcmp(g_yawStore, g_yawStoreOrig, sizeof(g_yawStoreOrig))) {
+        Log("rotate with view: another plugin changes the held item's rotation - disabled");
+        g_toggles[kToggleRotate].available = g_rotReady = false;
+        cfg.rotateWithView = 0;
+    }
+    CheckOtherPlugins();
+}
+
+static void OnSFSEMessage(SFSEMessagingInterface::Message* msg)
+{
+    if (msg && msg->type == SFSEMessagingInterface::kMessage_PostPostLoad) ApplyDeferred();
+}
+
+// Log goes to Documents\My Games\Starfield\SFSE\Logs (next to sfse.txt), else next to the DLL.
+static FILE* OpenLog()
+{
+    char p[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr, 0, p))) {
+        static const char* const parts[] = { "\\My Games", "\\Starfield", "\\SFSE", "\\Logs" };
+        for (const char* part : parts) {
+            strncat(p, part, MAX_PATH - strlen(p) - 1);
+            CreateDirectoryA(p, nullptr);
+        }
+        strncat(p, "\\NoMoreRed.log", MAX_PATH - strlen(p) - 1);
+        if (FILE* f = fopen(p, "w")) return f;
+    }
+    snprintf(p, sizeof(p), "%sNoMoreRed.log", g_dir);
+    return fopen(p, "w");
 }
 
 extern "C" __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
@@ -707,13 +1192,20 @@ extern "C" __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
     GetModuleFileNameA(self, g_dir, MAX_PATH);
     if (char* s = strrchr(g_dir, '\\')) s[1] = 0;
 
-    char logPath[MAX_PATH];
-    snprintf(logPath, sizeof(logPath), "%sNoMoreRed.log", g_dir);
-    g_log = fopen(logPath, "w");
+    g_log = OpenLog();
     Log("No More Red - runtime %08X, sfse %08X", sfse->runtimeVersion, sfse->sfseVersion);
 
     LoadConfig();
     if (!Install(sfse->runtimeVersion)) return true;
+
+    // Redirect the calls once every plugin has loaded; without messaging, do it now.
+    auto msg = (SFSEMessagingInterface*)sfse->QueryInterface(kInterface_Messaging);
+    if (msg && msg->RegisterListener(sfse->GetPluginHandle(), "SFSE", OnSFSEMessage))
+        Log("call hooks will be applied after all plugins have loaded");
+    else {
+        Log("SFSE messaging unavailable - applying hooks now");
+        ApplyDeferred();
+    }
 
     if (auto task = (SFSETaskInterface*)sfse->QueryInterface(kInterface_Task)) {
         task->AddTaskPermanent((SFSETaskInterface::ITaskDelegate*)&g_pollTask);

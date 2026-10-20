@@ -1,7 +1,5 @@
 # No More Red - Starfield 1.16.244 outpost placement RE notes
 
-These notes were written by AI during the process of the making this mod.
-
 Addresses are RVAs + 0x140000000 (Steam build 1.16.244, SteamStub-wrapped, .text not encrypted).
 
 ## Status byte
@@ -93,3 +91,45 @@ Older surface snapping notes:
 * Hidden INI settings that pick the behaviour (all default 0): `bUseAlwaysFollowGround`, `bUsePrecisePlacing`, `bUseFollowCameraForInteriors` ([Workshop]). In first person the game forces behaviour [0] unless bUseAlwaysFollowGround is set.
 The drop-to-ground pass in UpdatePlacementStatus runs when `fWorkshopDownwardShapeCastMinNormal (0.4) < root+0x5A4`
 (or `root+0x5A4 < fWorkshopUpwardShapeCastMinNormal (-0.4)` for ceiling items), or when the placement controller's +0x40 == 1.
+
+## Compatibility (v4)
+* Call sites are found at plugin load but redirected at SFSE PostPostLoad, after every plugin's
+  Load/PostLoad. A site another plugin already hooked is chained (our wrapper calls its target).
+* Starfield Engine Fixes 21.2 (hardcoded 1.16.244 RVAs) hooks the same calls and aborts with a
+  fatal MessageBox + TerminateProcess unless each E8 still targets the game function:
+  - bUnrestrictedBuildModePlacement: both callers of EvaluatePlacement (0xF3F9A0) -> forces status 2
+    unless 23/24 (EnableResourceRequirement) or 29 (EnablePerkRequirement); also
+    0x21D770C `mov [r14+193],1` -> 2, NOPs 0x21D8453 and 0x21D84B7 status writes,
+    0x21C5FA5 `lea ebp,[rcx+2]` -> `lea ebp,[rcx]`.
+  - bBuildModeItemContinuousRotation: NOPs rotation store at 0x21D7950, hooks both callers of
+    UpdatePlacementStatus (0x21D74B0) and writes root+0x184 itself.
+  Both default to 0. With v4 both install first and No More Red wraps them.
+* Log: Documents\My Games\Starfield\SFSE\Logs\NoMoreRed.log (fallback: plugin folder).
+
+## Deploy rule (from user)
+After every DLL deploy, list the target folder and confirm the DLL size/mtime matches the new build before reporting.
+Stage each deploy under a NEW filename in outputs (e.g. NoMoreRed_vXX.dll): re-committing the same staged path can write a stale copy.
+
+## Build mode gate / rotate with view (v5)
+* Hotkeys act only while UI::IsMenuOpen(WorkshopMenu): UI singleton 937580 (0x145FD9B80), IsMenuOpen 130475
+  (0x142544EC0), WorkshopMenu name getter 130425 (0x14253DDB0, verified by its "WorkshopMenu" lea).
+* Held item yaw = root+0x184 (radians, ref angle-z convention). UpdatePlacementStatus: surface branch does
+  yaw += root+0x70 (rotate input) so it stays world-fixed; follow-camera branch (0x1421D78E1..0x1421D7950)
+  recomputes it from the camera transform (0x1421CE760) every frame.
+* Rotate with view: before UpdatePlacementStatus, yaw += wrap(playerHeading - lastHeading); player 922868
+  (0x145F43230), heading at +0x88. SEF's version instead NOPs 0x1421D7950, hooks UpdatePlacementStatus
+  callers, tracks an absolute angle per held ref (handle lookup each frame) and polls its own keys.
+
+## 1.1.0 review
+* Build-area tests (WORKSHOP BOUNDARY off): ValidatePlacement 73744 -> IsInBuildArea 73891, surface cast 121585 and
+  follow-camera cast 121587 -> IsPointInBuildArea 73890 (these return code 10 and skip the held-item update = vanish),
+  player outside-area timer 121563 -> IsInBuildArea (player). All four calls answer "inside".
+* Foundation check red tint: UpdatePlacementStatus `mov [r14+193],al; ...; call 0x1421C5F70 (highlight, r8b=1)`
+  at 0x1421D8463 - told "valid" when the code will be relaxed.
+* Surface snapping off: ground type (root+0x12C) cleared after each drop pass and restored after UpdatePlacementStatus
+  (commit builds the auto-foundation from it).
+* Rotate with view / fine rotate: own yaw fed through the two re-read atan2 calls (0x1421D7947 neg, 0x1421D7A26);
+  re-read changes (= rotate keys turning the item) are added as deltas; snapped flag root+0x18B.
+* Ctrl+arrows: exe IAT USER32!GetRawInputData hooked; arrow key-downs hidden while Ctrl held in build mode, and
+  their key-ups only if the key-down was hidden.
+* Held item tracked from UpdatePlacementStatus (was SurfaceCast), so distance / fine rotate don't depend on surface snapping.
